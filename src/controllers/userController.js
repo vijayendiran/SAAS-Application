@@ -1,10 +1,9 @@
-import bcrypt from "bcrypt";
 import prisma from "../lib/prisma.js";
 import { logAudit } from "../utils/auditLogger.js";
 
 export const inviteUser = async (req, res) => {
   try {
-    const { name, email, password } = req.body;
+    const { name, email } = req.body;
 
     // Safety check
     if (!req.tenantId) {
@@ -20,13 +19,13 @@ export const inviteUser = async (req, res) => {
       return res.status(409).json({ message: "User already exists" });
     }
 
-    const hashedPassword = await bcrypt.hash(password, 10);
+
 
     const user = await prisma.user.create({
       data: {
         name,
         email,
-        password: hashedPassword,
+        password: "LOGTO_MANAGED_AUTH", // Auth is handled by Logto
         role: "member",
         tenantId: req.tenantId,
         createdBy: req.userId
@@ -37,7 +36,7 @@ export const inviteUser = async (req, res) => {
     await logAudit(req.tenantId, req.userId, "USER_INVITE", { invitedEmail: email, invitedUserId: user.id });
 
     res.status(201).json({
-      message: "User invited successfully",
+      message: "User invited successfully. Please ensure they are also invited in Logto Console.",
       userId: user.id
     });
   } catch (err) {

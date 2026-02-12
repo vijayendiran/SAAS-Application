@@ -1,42 +1,105 @@
-import jwt from "jsonwebtoken";
+import { createRemoteJWKSet, jwtVerify } from 'jose';
+import prisma from '../lib/prisma.js';
 
-export const authMiddleware = (req, res, next) => {
+// Configuration
+const LOGTO_ENDPOINT = process.env.LOGTO_ENDPOINT;
+const LOGTO_API_RESOURCE = process.env.LOGTO_API_RESOURCE;
+
+// Create a remote JWK Set (caches keys automatically)
+const JWKS = createRemoteJWKSet(new URL(`${LOGTO_ENDPOINT}/oidc/jwks`));
+
+export const authMiddleware = async (req, res, next) => {
+    let token;
+
+    // 1. Check Authorization Header (Bearer)
     const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-        return res.status(401).json({ message: "Authorization token Missing" });
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+        token = authHeader.split(' ')[1];
     }
-
-    const token = authHeader.split(/\s+/)[1]?.replace(/[<>"]/g, '');
-    console.log("Token value being verified (first 10 chars):", token?.substring(0, 10));
+    // 2. Check Cookie (for Traditional Web App flow)
+    else if (req.cookies && req.cookies.access_token) {
+        token = req.cookies.access_token;
+    }
 
     if (!token) {
-        return res.status(401).json({ message: "Token format invalid" });
+        // Stateless: No token = No user
+        req.user = null;
+        return next();
     }
 
-    if (!process.env.JWT_SECRET) {
-        console.error("CRITICAL ERROR: JWT_SECRET is not defined in environment variables.");
-        return res.status(500).json({ message: "Server configuration error" });
-    }
 
-    console.log("Verifying token with JWT_SECRET prefix:", process.env.JWT_SECRET.substring(0, 4));
+
 
     try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-        req.user = decoded;
-        req.userId = decoded.userId;
-        req.userTenantId = decoded.tenantId;
-        req.role = decoded.role;
-        next();
-    } catch (err) {
-        console.error("JWT Verification failed for token:", token.substring(0, 10) + "...");
-        console.error("Error name:", err.name);
-        console.error("Error message:", err.message);
-
-        return res.status(401).json({
-            message: "Invalid or Expired Token",
-            error: err.message,
-            tokenStatus: err.name === 'TokenExpiredError' ? 'expired' : 'invalid'
+        // Validate Token: Signature, Expiration, Issuer, Audience
+        const { payload } = await jwtVerify(token, JWKS, {
+            issuer: `${LOGTO_ENDPOINT}/oidc`,
+            audience: LOGTO_API_RESOURCE,
         });
+
+        // Token is valid
+
+        req.user = payload;
+
+        // Attempt to link to local DB User for permissions/tenancy
+        if (payload.email) {
+            const dbUser = await prisma.user.findUnique({
+                where: { email: payload.email },
+                include: { tenant: true }
+            });
+
+            if (dbUser) {
+                req.dbUser = dbUser;
+                req.userId = dbUser.id; // Use local ObjectId for DB compatibility
+                req.userTenantId = dbUser.tenantId; // For tenant matching
+                req.role = dbUser.role; // For legacy admin middleware
+            } else {
+                req.userId = payload.sub; // Fallback to Logto ID
+                // User is authenticated but not yet in local DB (needs onboarding?)
+            }
+        } else {
+            req.userId = payload.sub;
+        }
+
+        next();
+    } catch (error) {
+        console.error('JWT Validation Failed:', error.message);
+        // If token is present but invalid, we can choose to reject immediately or pass null
+        // For security, if they TRIED to authenticate and failed, we should probably warn or reject?
+        // But to keep consistent with "optional auth" pattern in middleware, we'll set user=null.
+        // Error details can be useful for debugging but shouldn't leak to client in production.
+        req.user = null;
+        req.authError = error.message; // valid for debugging
+        next();
     }
 };
+
+export const requireAuth = (req, res, next) => {
+    if (!req.user) {
+        return res.status(401).json({
+            message: 'Unauthorized',
+            error: req.authError || 'Authentication required',
+        });
+    }
+    next();
+};
+
+export const requireScopes = (requiredScopes) => {
+    return (req, res, next) => {
+        if (!req.user) {
+            return res.status(401).json({ message: 'Unauthorized' });
+        }
+
+        const tokenScopes = (req.user.scope || '').split(' ');
+        const hasAllScopes = requiredScopes.every(scope => tokenScopes.includes(scope));
+
+        if (!hasAllScopes) {
+            return res.status(403).json({
+                message: 'Forbidden: Insufficient permissions',
+                required: requiredScopes,
+            });
+        }
+        next();
+    };
+};
+
