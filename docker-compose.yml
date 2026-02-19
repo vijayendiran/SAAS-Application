@@ -1,0 +1,25 @@
+
+
+services:
+  backend:
+    build: .
+    container_name: saas-backend
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    depends_on:
+      - mongodb
+    restart: always
+
+  mongodb:
+    image: mongo:7
+    container_name: saas-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    restart: always
+
+volumes:
+  mongo_data:
